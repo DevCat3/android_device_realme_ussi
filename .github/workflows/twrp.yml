@@ -1,0 +1,169 @@
+name: TWRP Recovery Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      twrp_manifest_branch:
+        description: Select TWRP Version
+        required: true
+        default: twrp-12.1
+        type: choice
+        options:
+          - twrp-11
+          - twrp-12.1
+      device_tree_url:
+        description: Device Tree URL
+        required: true
+        default: https://github.com/DevCat3/android_device_realme_ussi
+        type: string
+      device_tree_branch:
+        description: Device Tree Branch
+        required: true
+        default: android-12.1
+        type: string
+      device_path:
+        description: Device Path
+        required: true
+        default: device/realme/ussi_arm64
+        type: string
+      device_codename:
+        description: Device Codename
+        required: true
+        default: ussi_arm64
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Clone device tree
+        run: |
+          git clone --depth=1 -b ${{ github.event.inputs.device_tree_branch }} ${{ github.event.inputs.device_tree_url }} device_tree
+
+      - name: Get commit info
+        id: commit_info
+        run: |
+          cd device_tree
+          echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "commit_msg=$(git log -1 --pretty=%s)" >> "$GITHUB_OUTPUT"
+          echo "tag_name=build-$(date +%Y%m%d%H%M%S)-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache
+          sudo docker image prune --all --force
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache curl flex \
+            g++-multilib gcc-multilib git git-lfs gnupg gperf imagemagick \
+            lib32ncurses5-dev lib32readline-dev lib32z1-dev liblz4-tool \
+            libncurses5 libncurses5-dev libsdl1.2-dev libssl-dev libxml2 \
+            libxml2-utils lzop pngcrush rsync schedtool squashfs-tools \
+            xsltproc zip zlib1g-dev python3 openjdk-8-jdk
+
+      - name: Set up git identity
+        run: |
+          git config --global user.name "DevCat3"
+          git config --global user.email "omarelbakery2008@gmail.com"
+
+      - name: Install repo tool
+        run: |
+          mkdir -p ~/bin
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Initialize TWRP manifest
+        run: |
+          mkdir -p ~/twrp
+          cd ~/twrp
+          repo init --depth=1 -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git -b ${{ github.event.inputs.twrp_manifest_branch }}
+          if grep -q "path=\"${{ github.event.inputs.device_path }}\"" .repo/manifests/default.xml; then
+            mkdir -p .repo/local_manifests
+            cat > .repo/local_manifests/remove_device.xml << 'EOF'
+          <manifest>
+            <remove-project path="DEVICE_PATH_PLACEHOLDER" />
+          </manifest>
+          EOF
+            sed -i "s|DEVICE_PATH_PLACEHOLDER|${{ github.event.inputs.device_path }}|" .repo/local_manifests/remove_device.xml
+          fi
+
+      - name: Sync sources
+        run: |
+          cd ~/twrp
+          repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags
+
+      - name: Copy device tree
+        run: |
+          mkdir -p ~/twrp/${{ github.event.inputs.device_path }}
+          rsync -a --exclude='.git' ${{ github.workspace }}/device_tree/ ~/twrp/${{ github.event.inputs.device_path }}/
+
+      - name: Build vendor boot image
+        run: |
+          cd ~/twrp
+          source build/envsetup.sh
+          lunch twrp_${{ github.event.inputs.device_codename }}-eng
+          set -o pipefail
+          mka vendorbootimage 2>&1 | tee ${{ github.workspace }}/build.log
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ${{ github.workspace }}/build.log
+          if-no-files-found: ignore
+
+      - name: Get build metadata
+        id: build_meta
+        run: |
+          echo "build_date=$(date +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Locate output image
+        id: locate_image
+        run: |
+          cd ~/twrp
+          OUT_DIR="out/target/product/${{ github.event.inputs.device_codename }}"
+          IMAGE_PATH="${OUT_DIR}/vendor_boot.img"
+          if [ ! -f "${IMAGE_PATH}" ]; then
+            echo "vendor_boot.img not found at ${IMAGE_PATH}"
+            exit 1
+          fi
+          cp "${IMAGE_PATH}" "${{ github.workspace }}/vendor_boot.img"
+          echo "image_path=${{ github.workspace }}/vendor_boot.img" >> "$GITHUB_OUTPUT"
+          echo "md5=$(md5sum ${{ github.workspace }}/vendor_boot.img | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Create recovery ZIP
+        run: |
+          cd ${{ github.workspace }}
+          zip -9 vendor_boot.zip vendor_boot.img
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: twrp-${{ github.event.inputs.twrp_manifest_branch }}-${{ github.event.inputs.device_codename }}-${{ steps.build_meta.outputs.build_date }}-${{ github.run_id }}
+          name: TWRP ${{ github.event.inputs.twrp_manifest_branch }} for ${{ github.event.inputs.device_codename }} // ${{ steps.build_meta.outputs.build_date }}
+          files: |
+            ${{ steps.locate_image.outputs.image_path }}
+            ${{ github.workspace }}/vendor_boot.zip
+          body: |
+            ## Build Information
+            - TWRP Version: ${{ github.event.inputs.twrp_manifest_branch }}
+            - Target: vendor_boot.img
+            - Device Tree: [${{ github.event.inputs.device_tree_branch }}](${{ github.event.inputs.device_tree_url }}/tree/${{ github.event.inputs.device_tree_branch }})
+            - Commit: [${{ steps.commit_info.outputs.sha_short }}](${{ github.event.inputs.device_tree_url }}/commit/${{ steps.commit_info.outputs.sha_short }})
+            - MD5: `${{ steps.locate_image.outputs.md5 }}`
+            - Built by: @${{ github.actor }}
+
+            ## Installation Instructions
+            Flash vendor_boot.img via fastboot: `fastboot flash vendor_boot vendor_boot.img`
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+          
