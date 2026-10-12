@@ -14,7 +14,7 @@ on:
       device_tree_url:
         description: Device Tree URL
         required: true
-        default: https://github.com/DevCat3/android_device_realme_ussi
+        default: https://github.com/DevCat3/android_device_realme_ussi_arm64
         type: string
       device_tree_branch:
         description: Device Tree Branch
